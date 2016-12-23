@@ -42,11 +42,10 @@ uint32_t g_FileSize;
 uint32_t g_Rate_rw, g_Rate_hot;
 uint32_t g_TestTime;
 uint32_t g_DataBlockNum;
-uint32_t g_HotBlockNum;
 
 unsigned short g_seed[3];
 uint8_t g_DataBlockAttr[MAX_DATA_BLOCK_NUM];
-uint8_t g_DataDisMode; //data distribution mode
+uint8_t g_DataDisMode;                       //data distribution mode
 char g_FilePath[PATH_MAX];
 
 typedef struct BaseDataBlock
@@ -95,20 +94,23 @@ void init_data_template()
     }
 }
 
-int init_data()
+void init_data_block(int fd, DATA_TYPE dataType, uint32_t blkIdx)
+{
+    g_DataBlockAttr[blkIdx] = dataType;
+
+    if(-1 == write(fd, &g_Template[dataType], sizeof(BaseDataBlock)))
+    {
+        printf("Block %d Write Err:%s\n", blkIdx, strerror(errno));
+    }
+
+    printf(" %d", dataType);
+}
+
+int init_file()
 {
     uint32_t i;
-    g_DataBlockNum = (g_FileSize >> OFFSET_1G) / sizeof(BaseDataBlock);
-    g_HotBlockNum = g_Rate_hot * g_DataBlockNum / 100;
-
-    init_rand_seed();
-    init_data_template();
-
-    if(g_DataBlockNum > MAX_DATA_BLOCK_NUM)
-    {
-        printf("Illegal DataBlockNum:%d, legal range[1, %d]\n", g_DataBlockNum, MAX_DATA_BLOCK_NUM);
-        return OP_ERROR;
-    }
+    DATA_TYPE dataType;
+    int block_num[DATA_TYPE_BUTT] = {0};
 
     int fd = open(g_FilePath, O_RDWR | O_APPEND | O_CREAT, 0666);
     {
@@ -121,52 +123,47 @@ int init_data()
 
     //init data block
     memset(g_DataBlockAttr, 0, sizeof(g_DataBlockAttr));
+
     if(100 > g_Rate_hot)
     {
-        int hot_block_num = 0;
-        DATA_TYPE dataType;
-        char c[DATA_TYPE_BUTT];
-
-        c[HOT_DATA] = '1';
-        c[COLD_DATA] = '0';
-
         for(i = 0; i < g_DataBlockNum; i++)
         {
-            if(get_random_num(100) <= g_Rate_hot)
-            {
-                dataType = HOT_DATA;
-            }
-            else
-            {
-                dataType = COLD_DATA;
-            }
-
-            g_DataBlockAttr[i] = dataType;
-            
-            if(-1 == write(fd, &g_Template[dataType], sizeof(BaseDataBlock)))
-            {
-                printf("Block %d Write Err:%s\n", i, strerror(errno));
-            }
-
-            printf(" %c", c[dataType]);
+            dataType = (get_random_num(100) <= g_Rate_hot) ? HOT_DATA : COLD_DATA;
+            init_data_block(fd, dataType, i);
+            block_num[dataType] += 1;
         }
-
-        printf("HotDataRate=%f\n", (double)hot_block_num/(double)g_DataBlockNum);
     }
     else
     {
         for(i = 0; i < g_DataBlockNum; i++)
         {
-            g_DataBlockAttr[i] = HOT_DATA;
-            if(-1 == write(fd, &g_Template[HOT_DATA], sizeof(BASE_DATA_BLOCK_SIZE)))
-            {
-                printf("Block %d Write Err:%s\n", i, strerror(errno));
-            }
+            dataType = HOT_DATA;
+            init_data_block(fd, dataType, i);
         }
+        block_num[HOT_DATA] = g_DataBlockNum;
+        block_num[COLD_DATA] = 0;
     }
 
+    printf("HotDataRate=%f\n", (double)block_num[HOT_DATA]/(double)g_DataBlockNum);
     close(fd);
+
     return OP_OK;
+}
+
+int init_data()
+{
+    g_DataBlockNum = (g_FileSize >> OFFSET_1G) / sizeof(BaseDataBlock);
+
+    if(g_DataBlockNum > MAX_DATA_BLOCK_NUM)
+    {
+        printf("Illegal DataBlockNum:%d, legal range[1, %d]\n", g_DataBlockNum, MAX_DATA_BLOCK_NUM);
+        return OP_ERROR;
+    }
+
+    init_rand_seed();
+    init_data_template();
+    
+    return init_file();
 }
 
 int init_param(char** argv)
@@ -176,7 +173,7 @@ int init_param(char** argv)
     g_Rate_hot = atoi(argv[3]);
     g_TestTime = atoi(argv[4]);
     g_DataDisMode = atoi(argv[5]);
-    
+
     memset(g_FilePath, 0, sizeof(g_FilePath));
     strncpy(g_FilePath, argv[6], sizeof(g_FilePath));
 
@@ -185,7 +182,7 @@ int init_param(char** argv)
         printf("Illegal rate Rate_rw:%d Rate_hot:%d, legal range[, 100]\n", g_Rate_rw, g_Rate_hot);
         return OP_ERROR;
     }
-    
+
     if(g_FileSize > 1024)
     {
         printf("File too large(%dG), legal range is [1, 1024]G\n", g_FileSize);
@@ -199,12 +196,12 @@ int init_param(char** argv)
     }
 
     printf("FileSize:%d \nRate_rw:%d \nRate_hot:%d \nTestTime:%d \nDataDisMode:%d \nFilePath:%s\n",
-           g_FileSize,
-           g_Rate_rw,
-           g_Rate_hot,
-           g_TestTime,
-           g_DataDisMode,
-           g_FilePath);
+            g_FileSize,
+            g_Rate_rw,
+            g_Rate_hot,
+            g_TestTime,
+            g_DataDisMode,
+            g_FilePath);
 
     return OP_OK;
 }
@@ -275,12 +272,12 @@ int main(int argc, char** argv)
 
             default:
                 printf("Illegal request_type\n");
-       }
+        }
 
-       if(get_curr_time() - start > (g_TestTime << 10))
-       {
-           break;
-       }
+        if(get_curr_time() - start > (g_TestTime << 10))
+        {
+            break;
+        }
     }while(1);
 
     return 0;
