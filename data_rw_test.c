@@ -224,7 +224,7 @@ uint32_t get_data_block_index()
 
     for(i = blkIdx + 1; i < g_DataBlockNum; i++)
     {
-        if(g_DataBlockAttr[blkIdx % MAX_DATA_BLOCK_NUM] == dataType)
+        if(g_DataBlockAttr[i % MAX_DATA_BLOCK_NUM] == dataType)
         {
             return i;
         }
