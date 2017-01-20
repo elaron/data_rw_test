@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <signal.h>
 
 #define OFFSET_512K 		(19)
 #define OFFSET_1G 		(30)
@@ -16,6 +17,9 @@
 #define BASE_DATA_BLOCK_SIZE 	(1 << OFFSET_512K)			//512K
 #define ARRAY_LEN		(BASE_DATA_BLOCK_SIZE >> 2)		//512K/4Byte
 #define MAX_DATA_BLOCK_NUM	(1 << (OFFSET_1T - OFFSET_512K)) 	//MAX FileSize=1T
+
+#define TRUE (1)
+#define FALSE (0)
 
 typedef enum OP_RESULT
 {
@@ -233,10 +237,13 @@ int init_param(char** argv)
     g_Rate_rw = atoi(argv[2]);
     g_Rate_hot = atoi(argv[3]);
     g_TestTime = atoi(argv[4]);
-    g_DataDisMode = atoi(argv[5]);
+    g_DataDisMode = atoi(argv[5])%2;
+
+    g_BlockSize = atoi(argv[6]);
+    g_BlockSize_Byte = g_BlockSize * sizeof(BaseDataBlock);
 
     memset(g_FilePath, 0, sizeof(g_FilePath));
-    strncpy(g_FilePath, argv[6], sizeof(g_FilePath));
+    strncpy(g_FilePath, argv[7], sizeof(g_FilePath));
 
     if(g_Rate_rw > 100 || g_Rate_hot > 100)
     {
@@ -256,12 +263,13 @@ int init_param(char** argv)
         return OP_ERROR;
     }
 
-    printf("FileSize:%d \nRate_rw:%d \nRate_hot:%d \nTestTime:%d \nDataDisMode:%d \nFilePath:%s\n",
+    printf("FileSize:%d \nRate_rw:%d \nRate_hot:%d \nTestTime:%d \nDataDisMode:%d \nBlockSize:%dk \nFilePath:%s\n",
             g_FileSize,
             g_Rate_rw,
             g_Rate_hot,
             g_TestTime,
             g_DataDisMode,
+            g_BlockSize,
             g_FilePath);
 
     return OP_OK;
@@ -269,12 +277,12 @@ int init_param(char** argv)
 
 REQUEST_TYPE get_request_type()
 {
-    return WRITE_REQ;
+    return (get_random_num(100) <= g_Rate_rw) ? READ_REQ : WRITE_REQ;
 }
 
 uint32_t get_data_block_index()
 {
-    DATA_TYPE dataType = (get_random_num(100) >= g_Rate_hot) ? HOT_DATA : COLD_DATA;
+    DATA_TYPE dataType = (get_random_num(100) >= 20) ? HOT_DATA : COLD_DATA;
     uint32_t blkIdx = get_random_num(g_DataBlockNum);
     uint32_t i;
 
@@ -297,16 +305,223 @@ uint32_t get_data_block_index()
 void write_data()
 {
     uint32_t blkIdx = get_data_block_index();
+    int ret = 0;
+    off_t offset;
+
+#ifdef RANDOM_IDX_SHOW
+    printf("w_idx:%ld\n", blkIdx);
+#endif
+
+    ret = lseek(g_Fd, sizeof(BaseDataBlock) * blkIdx, SEEK_SET);
+    if(-1 == ret)
+    {
+        printf("Lseek file fail! Err:%s blockIdx:%d \n", strerror(errno), blkIdx);
+        return;
+    }
+
+    DATA_TYPE dataType = g_DataBlockAttr[blkIdx];
+
+    ret = write(g_Fd, g_pTemplate[dataType], g_BlockSize_Byte);
+    if(-1 == ret)
+    {
+        printf("Write data fail! blockIdx=%d Err:%s\n");
+        return;
+    }
+}
+
+void read_data()
+{
+    uint32_t blkIdx = get_data_block_index();
+    int ret;
+    off_t offset;
+#ifdef RANDOM_IDX_SHOW
+    printf("r_idx:%ld \n", blkIdx);
+#endif
+
+    ret = lseek(g_Fd, sizeof(BaseDataBlock) * blkIdx, SEEK_SET);
+    if(-1 == ret)
+    {
+        printf("Lseek file fail! Err:%s blockIdx:%d\n", strerror(errno), blkIdx);
+        return;
+    }
+
+    DATA_TYPE dataType = g_DataBlockAttr[blkIdx];
+
+    ret = read(g_Fd, g_pBuff, g_BlockSize * sizeof(BaseDataBlock));
+    if(-1 == ret)
+    {
+        printf("Lseek file fail! Err:%s blockIdx:%ld \n", strerror(errno), blkIdx);
+    }
+    else
+    {
+        uint32_t i, arrIdx, data;
+        uint64_t chkSum = 0;
+        BaseDataBlock *pBlock = (BaseDataBlock*)g_pBuff;
+
+        for(i = 0; i < g_BlockSize; i++)
+        {
+            for(arrIdx = 0; arrIdx < ARRAY_LEN; arrIdx++)
+            {
+#ifdef SHOW_READ_DATA
+                printf("DataType:%d arr[%d]=%d \n",dataType, arrIdx, pBlock->arr[arrIdx]);
+#endif
+                data = pBlock->arr[arrIdx];
+            }
+            pBlock++;
+        }
+    }
+}
+
+int timesup()
+{
+    uint64_t now = get_curr_time();
+
+    if(now - g_TestStartTime > g_TestTime*1000)
+    {
+        printf("Now:%ld start:%ld delta:%ld testTime:%ld \n",
+                        now,
+                        g_TestStartTime,
+                        now - g_TestStartTime,
+                        g_TestTime);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void *do_test()
+{
+    REQUEST_TYPE request;
+    memset(&g_Stat, 0, sizeof(Stat));
+
+    do
+    {
+        request = get_request_type();
+        switch(request)
+        {
+            case WRITE_REQ:
+                write_data();
+                break;
+
+            case READ_REQ:
+                read_data();
+                break;
+
+            default:
+                printf("Illegal request type[%d]!", request);
+        }
+
+        g_Stat.proc_blk_cnt[request]++;
+        if(timesup())
+        {
+            break;
+        }
+
+    }while(TRUE);
+}
+
+void* do_monitor()
+{
+    Stat last_stat;
+    memset(&last_stat, 0, sizeof(Stat));
+
+    do
+    {
+        REQUEST_TYPE type;
+        double rwKib[REQUEST_TYPE_BUTT];
+
+        for(type = 0; type < REQUEST_TYPE_BUTT; type++)
+        {
+            uint32_t increaseBlkCnt = g_Stat.proc_blk_cnt[type] - last_stat.proc_blk_cnt[type];
+            rwKib[type] = (double)(increaseBlkCnt * g_BlockSize_Byte)/(double)(1 << 20);
+        }
+
+        printf("Monitoring ... read:%.2fM write:%.2fM \n", rwKib[READ_REQ], rwKib[WRITE_REQ]);
+        memcpy(&last_stat, &g_Stat, sizeof(Stat));
+        sleep(1);
+
+        if(timesup())
+        {
+            printf("Time's up!\n");
+            break;
+        }
+    }while(TRUE);
+}
+
+void create_thread()
+{
+    int ret = 0;
+    memset(g_Thread, 0, sizeof(g_Thread));
+
+    if(0!= pthread_create(&g_Thread[DO_TEST_THRD], NULL, do_test, NULL))
+    {
+        printf("Start testing fail!\n");
+    }
+    else
+    {
+        printf("Start testing success!\n");
+    }
+
+    if(0!= pthread_create(&g_Thread[MONITOR_THRD], NULL, do_monitor, NULL))
+    {
+        printf("Start monitoring fail!\n");
+    }
+    else
+    {
+        printf("Start monitoring success!\n");
+    }
+}
+
+void wait_threads()
+{
+    THREAD_TYPE type;
+    for(type = 0; type < THREAD_TYPE_BUTT; type++)
+    {
+        if(g_Thread[type] != 0)
+        {
+            pthread_join(g_Thread[type], NULL);
+        }
+    }
+}
+
+void print_result()
+{
+    uint64_t spendTime = (get_curr_time() - g_TestStartTime)/1000UL;
+
+    REQUEST_TYPE type;
+    double rwKib[REQUEST_TYPE_BUTT];
+
+    for(type = 0; type < REQUEST_TYPE_BUTT; type++)
+    {
+        rwKib[type] = (double)((g_Stat.proc_blk_cnt[type] * g_BlockSize_Byte) >> 20)/(double)spendTime;
+    }
+
+    printf("Result - readBlkCnt:%lu writeBlkCnt:%lu read:%.2fM write:%.2fM \n",
+                    g_Stat.proc_blk_cnt[READ_REQ],
+                    g_Stat.proc_blk_cnt[WRITE_REQ],
+                    rwKib[READ_REQ],
+                    rwKib[WRITE_REQ]);
+}
+
+void stop()
+{
+    print_result();
+    close(g_Fd);
+    DATA_TYPE dataType;
+
+    for(dataType = 0; dataType < DATA_TYPE_BUTT; dataType++)
+    {
+        free(g_pTemplate[dataType]);
+    }
+    free(g_pBuff);
+
+    _exit(0);
 }
 
 int main(int argc, char** argv)
 {
-    REQUEST_TYPE request;
-    uint64_t start;
-
-    if(7 != argc)
+    if(8 != argc)
     {
-        printf("Useage: data_rw_test FileSize(G) Rate_rw Rate_hot TestTime(s) DataDisMode FilePath\n");
+        printf("Useage: data_rw_test FileSize(G) Rate_read Rate_hot TestTime(s) DataDisMode[0,1] BlockSize(K) FilePath\n");
         return 0;
     }
 
@@ -320,26 +535,14 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    start = get_curr_time();
+    signal(SIGINT, stop);
+    g_TestStartTime = get_curr_time();
 
-    do
-    {
-        request = get_request_type();
-        switch(request)
-        {
-            case WRITE_REQ:
-                write_data();
-                break;
+    create_thread();
+    wait_threads();
+    close(g_Fd);
 
-            default:
-                printf("Illegal request_type\n");
-        }
-
-        if(get_curr_time() - start > (g_TestTime << 10))
-        {
-            break;
-        }
-    }while(1);
+    print_result();
 
     return 0;
 }
